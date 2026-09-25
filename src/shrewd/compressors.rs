@@ -1,7 +1,7 @@
 use std::mem::{size_of, size_of_val};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 
-use super::sizes::{HyperLogLog, DataSize, IndexSize, SIZE_I8, SIZE_I16, SIZE_I32, SIZE_I64};
+use super::sizes::{HyperLogLog, DataSize, IndexSize};
 use super::{Compressor, Shrewd, SizeCompressor, AverageCompressor, DictionaryCompressor};
 
 
@@ -122,7 +122,7 @@ impl Compressor for Shrewd {
 
 
 impl SizeCompressor {
-    fn _compress(v: Vec<i64>, data_size:DataSize) -> Self {
+    pub(crate) fn _compress(v: Vec<i64>, data_size:DataSize) -> Self {
         let mut data: Vec<u8> = Vec::with_capacity(v.len() * data_size as usize);
 
         match data_size {
@@ -176,27 +176,27 @@ impl Compressor for SizeCompressor {
         match self.data_size {
             DataSize::I8 => self.data[index] as i8 as i64,
             DataSize::I16 => {
-                let real_index = index * SIZE_I16 as usize;
+                let real_index = index * DataSize::I16 as usize;
                 let val = i16::from_ne_bytes(
-                    self.data[real_index..(real_index + SIZE_I16 as usize)]
+                    self.data[real_index..(real_index + DataSize::I16 as usize)]
                         .try_into()
                         .unwrap(),
                 );
                 val as i64
             }
             DataSize::I32 => {
-                let real_index = index * SIZE_I32 as usize;
+                let real_index = index * DataSize::I32 as usize;
                 let val = i32::from_ne_bytes(
-                    self.data[real_index..(real_index + SIZE_I32 as usize)]
+                    self.data[real_index..(real_index + DataSize::I32 as usize)]
                         .try_into()
                         .unwrap(),
                 );
                 val as i64
             }
             DataSize::I64 => {
-                let real_index = index * SIZE_I64 as usize;
+                let real_index = index * DataSize::I64 as usize;
                 i64::from_ne_bytes(
-                    self.data[real_index..(real_index + SIZE_I64 as usize)]
+                    self.data[real_index..(real_index + DataSize::I64 as usize)]
                         .try_into()
                         .unwrap(),
                 )
@@ -222,7 +222,7 @@ impl Compressor for SizeCompressor {
 
 
 impl AverageCompressor {
-    fn _compress(v: Vec<i64>, original_data_size: DataSize, avg: i64, max_delta_from_avg: DataSize) -> Self {
+    pub(crate) fn _compress(v: Vec<i64>, original_data_size: DataSize, avg: i64, max_delta_from_avg: DataSize) -> Self {
         let cap;
         match max_delta_from_avg {
             DataSize::I8 => cap = v.len(),
@@ -450,7 +450,7 @@ impl Compressor for DictionaryCompressor {
     }
 
     fn size(&self) -> usize {
-        self.data.len() + (self.unique_values.len() * SIZE_I64 as usize) + size_of_val(self)
+        self.data.len() + (self.unique_values.len() * DataSize::I64 as usize) + size_of_val(self)
     }
 
     #[inline(always)]
@@ -488,22 +488,22 @@ mod tests {
         let compressor = SizeCompressor::pack(random_i8s.clone());
         assert_eq!(compressor.data_size, DataSize::I8);
         assert_eq!(compressor.length(), random_i8s.len());
-        assert_eq!(compressor.size(), size_of_val(&compressor) + (random_i8s.len() * SIZE_I8 as usize));
+        assert_eq!(compressor.size(), size_of_val(&compressor) + (random_i8s.len() * DataSize::I8 as usize));
 
         let compressor = SizeCompressor::pack(random_i16s.clone());
         assert_eq!(compressor.data_size, DataSize::I16);
         assert_eq!(compressor.length(), random_i16s.len());
-        assert_eq!(compressor.size(), size_of_val(&compressor) + (random_i16s.len() * SIZE_I16 as usize));
+        assert_eq!(compressor.size(), size_of_val(&compressor) + (random_i16s.len() * DataSize::I16 as usize));
 
         let compressor = SizeCompressor::pack(random_i32s.clone());
         assert_eq!(compressor.data_size, DataSize::I32);
         assert_eq!(compressor.length(), random_i32s.len());
-        assert_eq!(compressor.size(), size_of_val(&compressor) + (random_i32s.len() * SIZE_I32 as usize));
+        assert_eq!(compressor.size(), size_of_val(&compressor) + (random_i32s.len() * DataSize::I32 as usize));
 
         let compressor = SizeCompressor::pack(random_i64s.clone());
         assert_eq!(compressor.data_size, DataSize::I64);
         assert_eq!(compressor.length(), random_i64s.len());
-        assert_eq!(compressor.size(), size_of_val(&compressor) + (random_i64s.len() * SIZE_I64 as usize));
+        assert_eq!(compressor.size(), size_of_val(&compressor) + (random_i64s.len() * DataSize::I64 as usize));
     }
 
     #[test]
@@ -561,13 +561,13 @@ mod tests {
     fn test_size_compressor_memory_footprint() {
         let data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         let uncompressed_data_memory_footprint =
-            size_of_val(&data) + (data.len() * SIZE_I64 as usize);
+            size_of_val(&data) + (data.len() * DataSize::I64 as usize);
         let compressor = SizeCompressor::pack(data.clone());
         let compressed_data_memory_footprint = compressor.size();
         println!("data size (stack + heap): {compressed_data_memory_footprint}");
         assert_eq!(
             compressed_data_memory_footprint,
-            size_of::<SizeCompressor>() + data.len() * (SIZE_I8 as usize)
+            size_of::<SizeCompressor>() + data.len() * (DataSize::I8 as usize)
         );
         assert!(compressed_data_memory_footprint < uncompressed_data_memory_footprint);
     }
@@ -576,7 +576,7 @@ mod tests {
     fn test_avg_compressor_memory_footprint() {
         let data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         let uncompressed_data_memory_footprint =
-            size_of_val(&data) + (data.len() * SIZE_I64 as usize);
+            size_of_val(&data) + (data.len() * DataSize::I64 as usize);
         let compressor = AverageCompressor::pack(data.clone());
         let compressed_data_memory_footprint = compressor.size();
         assert_eq!(
@@ -606,9 +606,9 @@ mod tests {
         let compressed_data_memory_footprint = compressor.size();
         assert_eq!(
             compressed_data_memory_footprint,
-            size_of::<DictionaryCompressor>() + 12 + (2 * SIZE_I64) as usize
+            size_of::<DictionaryCompressor>() + 12 + (2 * DataSize::I64 as usize) as usize
         );
-        let uncompressed_data_memory_footprint = data.len() * SIZE_I64 as usize;
+        let uncompressed_data_memory_footprint = data.len() * DataSize::I64 as usize;
         assert!(compressed_data_memory_footprint < uncompressed_data_memory_footprint);
     }
 

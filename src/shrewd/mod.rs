@@ -19,19 +19,19 @@ pub enum Shrewd {
     Dictionary(DictionaryCompressor),
 }
 
-pub(crate) struct SizeCompressor {
+pub struct SizeCompressor {
     pub(crate) data: Vec<u8>,
     pub(crate) data_size: DataSize,
 }
 
-pub(crate) struct AverageCompressor {
+pub struct AverageCompressor {
     pub(crate) data: Vec<u8>,
     pub(crate) data_size: DataSize,
     pub(crate) avg: i64,
     pub(crate) original_data_size: DataSize,
 }
 
-pub(crate) struct DictionaryCompressor {
+pub struct DictionaryCompressor {
     pub(crate) data: Vec<u8>,
     pub(crate) unique_values: Vec<i64>,
     pub(crate) index_size: IndexSize,

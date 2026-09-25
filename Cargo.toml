@@ -1,0 +1,17 @@
+[package]
+name = "shrewd-rs"
+version = "0.1.0"
+edition = "2024"
+authors = [ "Gil Tankus gil.tankus@gmail.com"]
+description = "A zero-vtable high-performance compression vector engine."
+readme = "README.md"
+license = "Apache-2.0"
+
+[dev-dependencies]
+rand = {version = "0.10.3"}
+
+[profile.release]
+opt-level = 3       # Triggers LLVM's absolute highest vectorization routines
+lto = true          # Enables Link-Time Optimization across module boundaries
+codegen-units = 1   # Minimizes code generation splits to allow deep cross-inlining
+panic = "abort"     # Strips heavy stack-unwinding machinery for micro-ben

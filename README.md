@@ -1,4 +1,4 @@
-# shrewd 🦔
+# shrewd 🦊
 
 `shrewd` is a fast, allocation-conscious compression vector engine written in pure Rust. It transforms loose, oversized `Vec<i64>` series into tightly fitted, random-access byte structures using data-driven heuristic routing.
 

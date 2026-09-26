@@ -1,64 +1,48 @@
+use std::cmp::max;
 use std::mem::{size_of, size_of_val};
 use std::collections::{HashMap};
-
+use std::string::ToString;
 use super::sizes::{HyperLogLog, DataSize, IndexSize};
-use super::{Compressor, Shrewd, SizeCompressor, AverageCompressor, DictionaryCompressor};
+use super::{Compressor, Shrewd, Inner, SizeCompressor, OffsetCompressor, DictionaryCompressor};
+
+const COMPRESSOR_TYPE_SIZE: &str = "Size";
+const COMPRESSOR_TYPE_OFFSET: &str = "Offset";
+const COMPRESSOR_TYPE_DICTIONARY: &str = "Dictionary";
+
 
 
 impl Compressor for Shrewd {
     fn pack(v: Vec<i64>) -> Self {
         if v.is_empty() {
-            return Shrewd::Size(SizeCompressor::pack(v));
+            return Shrewd(Inner::Size(SizeCompressor::pack(v)));
         }
 
         // --- PHASE 1: LIGHTWEIGHT ESTIMATION PASS (O(N)) ---
         let mut min_val = v[0];
         let mut max_val = v[0];
-        let mut avg: f64 = 0.0f64;
-        let mut original_data_size = DataSize::I8;
 
         let mut hll = HyperLogLog::new(12);
 
-        for (index, &value) in v.iter().enumerate() {
+        for &value in v.iter() {
             if value < min_val {
                 min_val = value;
             }
             if value > max_val {
                 max_val = value;
             }
-            let count = (index + 1) as f64;
-            avg += (value as f64 - avg) / count;
-
-            let val_size = DataSize::calculate(value);
-            if val_size > original_data_size {
-                original_data_size = val_size;
-            }
 
             hll.insert(value);
         }
 
-        let avg = avg.round() as i64;
+        let original_data_size = max(DataSize::calculate(min_val), DataSize::calculate(max_val));
+        let (center, max_delta_from_center) = OffsetCompressor::midpoint_and_width(min_val, max_val);
 
-        // --- PHASE 2: CALCULATE PRECISE METRIC FOOTPRINTS ---
+        // --- PHASE 2: CALCULATE PRECISE METRIC FOOTPRINTS (O(1)) ---
         // 1. SizeCompressor Footprint
         let size_est_bytes = v.len() * original_data_size as u8 as usize;
 
-        // 2. AverageCompressor Footprint
-        let mut max_delta_from_avg = DataSize::I8;
-        for &val in v.iter() {
-            let delta = match original_data_size {
-                DataSize::I8 => (val as i8).wrapping_sub(avg as i8) as i64,
-                DataSize::I16 => (val as i16).wrapping_sub(avg as i16) as i64,
-                DataSize::I32 => (val as i32).wrapping_sub(avg as i32) as i64,
-                DataSize::I64 => val.wrapping_sub(avg),
-            };
-            let d = DataSize::calculate(delta);
-            if d > max_delta_from_avg {
-                max_delta_from_avg = d;
-                if max_delta_from_avg == DataSize::I64 { break; }
-            }
-        }
-        let avg_est_bytes = v.len() * max_delta_from_avg as u8 as usize;
+        // 2. OffsetCompressor Footprint
+        let offset_est_bytes = v.len() * max_delta_from_center as u8 as usize;
 
         // 3. DictionaryCompressor Footprint
         let unique_count = hll.estimate(); // Highly scalable O(1) extraction
@@ -73,49 +57,49 @@ impl Compressor for Shrewd {
         // --- PHASE 3: EVALUATE WINNER AND DISPATCH INITIALIZATION ---
         let low_uniqueness = unique_count < v.len() / 2;
 
-        if low_uniqueness && dict_est_bytes < size_est_bytes && dict_est_bytes < avg_est_bytes {
-            Shrewd::Dictionary(DictionaryCompressor::pack(v))
-        } else if avg_est_bytes < size_est_bytes {
-            Shrewd::Average(AverageCompressor::_compress(v, original_data_size, avg, max_delta_from_avg))
+        if low_uniqueness && dict_est_bytes < size_est_bytes && dict_est_bytes < offset_est_bytes {
+            Shrewd(Inner::Dictionary(DictionaryCompressor::pack(v)))
+        } else if offset_est_bytes < size_est_bytes {
+            Shrewd(Inner::Offset(OffsetCompressor::_compress(v, original_data_size, center, max_delta_from_center)))
         } else {
-            Shrewd::Size(SizeCompressor::_compress(v, original_data_size))
+            Shrewd(Inner::Size(SizeCompressor::_compress(v, original_data_size)))
         }
     }
 
     #[inline(always)]
-    fn get(&self, index: usize) -> i64 {
-        match self {
-            Shrewd::Size(c) => c.get(index),
-            Shrewd::Average(c) => c.get(index),
-            Shrewd::Dictionary(c) => c.get(index),
+    fn get(&self, index: usize) -> Option<i64> {
+        match &self.0 {
+            Inner::Size(c) => c.get(index),
+            Inner::Offset(c) => c.get(index),
+            Inner::Dictionary(c) => c.get(index),
         }
     }
 
     #[inline]
     fn size(&self) -> usize {
         // Includes the small stack-overhead variant size of the tracking enum container itself
-        match self {
-            Shrewd::Size(c) => c.size() + size_of_val(self),
-            Shrewd::Average(c) => c.size() + size_of_val(self),
-            Shrewd::Dictionary(c) => c.size() + size_of_val(self),
+        match &self.0 {
+            Inner::Size(c) => c.size() - size_of_val(c) + size_of_val(self),
+            Inner::Offset(c) => c.size() - size_of_val(c) + size_of_val(self),
+            Inner::Dictionary(c) => c.size() - size_of_val(c) + size_of_val(self),
         }
     }
 
     #[inline]
     fn length(&self) -> usize {
-        match self {
-            Shrewd::Size(c) => c.length(),
-            Shrewd::Average(c) => c.length(),
-            Shrewd::Dictionary(c) => c.length(),
+        match &self.0 {
+            Inner::Size(c) => c.length(),
+            Inner::Offset(c) => c.length(),
+            Inner::Dictionary(c) => c.length(),
         }
     }
 
     #[inline(always)]
     fn compressor_type(&self) -> String {
-        match self {
-            Shrewd::Size(c) => c.compressor_type(),
-            Shrewd::Average(c) => c.compressor_type(),
-            Shrewd::Dictionary(c) => c.compressor_type(),
+        match &self.0 {
+            Inner::Size(c) => c.compressor_type(),
+            Inner::Offset(c) => c.compressor_type(),
+            Inner::Dictionary(c) => c.compressor_type(),
         }
     }
 }
@@ -172,8 +156,11 @@ impl Compressor for SizeCompressor {
         Self::_compress(v, size)
     }
 
-    fn get(&self, index: usize) -> i64 {
-        match self.data_size {
+    fn get(&self, index: usize) -> Option<i64> {
+        if index >= self.length() {
+            return None;
+        }
+        let value = match self.data_size {
             DataSize::I8 => self.data[index] as i8 as i64,
             DataSize::I16 => {
                 let real_index = index * DataSize::I16 as usize;
@@ -201,7 +188,8 @@ impl Compressor for SizeCompressor {
                         .unwrap(),
                 )
             }
-        }
+        };
+        Some(value)
     }
 
     fn size(&self) -> usize {
@@ -215,16 +203,31 @@ impl Compressor for SizeCompressor {
 
     #[inline(always)]
     fn compressor_type(&self) -> String {
-        String::from("Size")
+        COMPRESSOR_TYPE_SIZE.to_string()
     }
 }
 
 
 
-impl AverageCompressor {
-    pub(crate) fn _compress(v: Vec<i64>, original_data_size: DataSize, avg: i64, max_delta_from_avg: DataSize) -> Self {
+impl OffsetCompressor {
+    pub(crate) fn midpoint_and_width(min_val: i64, max_val: i64) -> (i64, DataSize) {
+        let mid = ((min_val as i128 + max_val as i128 + 1) >> 1) as i64;
+        let range = (max_val as i128 - min_val as i128) as u64;
+        let width = if range <= u8::MAX as u64 {
+            DataSize::I8
+        } else if range <= u16::MAX as u64 {
+            DataSize::I16
+        } else if range <= u32::MAX as u64 {
+            DataSize::I32
+        } else {
+            DataSize::I64
+        };
+        (mid, width)
+    }
+
+    pub(crate) fn _compress(v: Vec<i64>, original_data_size: DataSize, center: i64, max_delta_from_center: DataSize) -> Self {
         let cap;
-        match max_delta_from_avg {
+        match max_delta_from_center {
             DataSize::I8 => cap = v.len(),
             DataSize::I16 => cap = size_of::<i16>() * v.len(),
             DataSize::I32 => cap = size_of::<i32>() * v.len(),
@@ -235,12 +238,12 @@ impl AverageCompressor {
 
         for value in v.into_iter() {
             let transformed_value = match original_data_size {
-                DataSize::I8 => (value as i8).wrapping_sub(avg as i8) as i64,
-                DataSize::I16 => (value as i16).wrapping_sub(avg as i16) as i64,
-                DataSize::I32 => (value as i32).wrapping_sub(avg as i32) as i64,
-                DataSize::I64 => value.wrapping_sub(avg),
+                DataSize::I8 => (value as i8).wrapping_sub(center as i8) as i64,
+                DataSize::I16 => (value as i16).wrapping_sub(center as i16) as i64,
+                DataSize::I32 => (value as i32).wrapping_sub(center as i32) as i64,
+                DataSize::I64 => value.wrapping_sub(center),
             };
-            match max_delta_from_avg {
+            match max_delta_from_center {
                 DataSize::I8 => {
                     compressed_data.extend_from_slice(&(transformed_value as i8).to_ne_bytes());
                 }
@@ -256,52 +259,40 @@ impl AverageCompressor {
             }
         }
 
-        AverageCompressor {
+        OffsetCompressor {
             data: compressed_data,
-            data_size: max_delta_from_avg,
-            avg: avg,
+            data_size: max_delta_from_center,
+            center: center,
             original_data_size: original_data_size,
         }
     }
 }
 
-impl Compressor for AverageCompressor {
+impl Compressor for OffsetCompressor {
     fn pack(v: Vec<i64>) -> Self {
-        let mut avg: f64 = 0f64;
-        let mut original_data_size = DataSize::I8;
-        for (index, &value) in v.iter().enumerate() {
-            let count = (index + 1) as f64;
-            avg += (value as f64 - avg) / count;
-            let data_size = DataSize::calculate(value);
-            if data_size > original_data_size {
-                original_data_size = data_size;
-            }
-        }
-        let avg = avg.round() as i64;
-        let mut size = DataSize::I8;
-
-        for &value in v.iter() {
-            let data_size = match original_data_size {
-                DataSize::I8 => DataSize::calculate((value as i8).wrapping_sub(avg as i8) as i64),
-                DataSize::I16 => {
-                    DataSize::calculate((value as i16).wrapping_sub(avg as i16) as i64)
-                }
-                DataSize::I32 => {
-                    DataSize::calculate((value as i32).wrapping_sub(avg as i32) as i64)
-                }
-                DataSize::I64 => DataSize::calculate(value.wrapping_sub(avg)),
+        if v.is_empty() {
+            return OffsetCompressor {
+                data: vec![],
+                data_size: DataSize::I8,
+                center: 0,
+                original_data_size: DataSize::I8,
             };
-            if data_size > size {
-                size = data_size;
-                if size == DataSize::I64 {
-                    break;
-                }
-            }
         }
-        Self::_compress(v, original_data_size, avg, size)
+        let mut min_val = i64::MAX;
+        let mut max_val = i64::MIN;
+        for &value in v.iter() {
+            min_val = min_val.min(value);
+            max_val = max_val.max(value);
+        }
+        let original_data_size = max(DataSize::calculate(min_val), DataSize::calculate(max_val));
+        let (center, size) = Self::midpoint_and_width(min_val, max_val);
+        Self::_compress(v, original_data_size, center, size)
     }
 
-    fn get(&self, index: usize) -> i64 {
+    fn get(&self, index: usize) -> Option<i64> {
+        if index >= self.length() {
+            return None;
+        }
         let transformed_value = match self.data_size {
             DataSize::I8 => self.data[index] as i8 as i64,
             DataSize::I16 => {
@@ -330,17 +321,18 @@ impl Compressor for AverageCompressor {
             }
         };
 
-        match self.original_data_size {
-            // no bugs here because the avg is at most the size of the self.original_data_size field
-            DataSize::I8 => (transformed_value as i8).wrapping_add(self.avg as i8) as i64,
-            DataSize::I16 => (transformed_value as i16).wrapping_add(self.avg as i16) as i64,
-            DataSize::I32 => (transformed_value as i32).wrapping_add(self.avg as i32) as i64,
-            DataSize::I64 => transformed_value.wrapping_add(self.avg),
-        }
+        let value = match self.original_data_size {
+            // no bugs here because the center is at most the size of the self.original_data_size field
+            DataSize::I8 => (transformed_value as i8).wrapping_add(self.center as i8) as i64,
+            DataSize::I16 => (transformed_value as i16).wrapping_add(self.center as i16) as i64,
+            DataSize::I32 => (transformed_value as i32).wrapping_add(self.center as i32) as i64,
+            DataSize::I64 => transformed_value.wrapping_add(self.center),
+        };
+        Some(value)
     }
 
     fn size(&self) -> usize {
-        // size of vec data + vec pointer + size enum + avg
+        // size of vec data + vec pointer + size enum + center
         self.data.len() + size_of_val(self)
     }
 
@@ -351,12 +343,19 @@ impl Compressor for AverageCompressor {
 
     #[inline(always)]
     fn compressor_type(&self) -> String {
-        String::from("Average")
+        COMPRESSOR_TYPE_OFFSET.to_string()
     }
 }
 
 impl Compressor for DictionaryCompressor {
     fn pack(v: Vec<i64>) -> Self {
+        if v.is_empty() {
+            return DictionaryCompressor {
+                data: vec![],
+                unique_values: vec![],
+                index_size: IndexSize::U8,
+            };
+        }
         let mut lookup: HashMap<i64, usize> = HashMap::with_capacity(v.len() / 2);
         let mut index = 0usize;
         for &value in v.iter() {
@@ -408,8 +407,11 @@ impl Compressor for DictionaryCompressor {
         }
     }
 
-    fn get(&self, index: usize) -> i64 {
-        match self.index_size {
+    fn get(&self, index: usize) -> Option<i64> {
+        if index >= self.length() {
+            return None;
+        }
+        let value = match self.index_size {
             IndexSize::U8 => {
                 let dict_index = self.data[index];
                 self.unique_values[dict_index as usize]
@@ -441,7 +443,8 @@ impl Compressor for DictionaryCompressor {
                 );
                 self.unique_values[dict_index as usize]
             }
-        }
+        };
+        Some(value)
     }
 
     #[inline]
@@ -455,7 +458,7 @@ impl Compressor for DictionaryCompressor {
 
     #[inline(always)]
     fn compressor_type(&self) -> String {
-        String::from("Dictionary")
+        COMPRESSOR_TYPE_DICTIONARY.to_string()
     }
 }
 
@@ -507,25 +510,25 @@ mod tests {
     }
 
     #[test]
-    fn test_avg_compressor_basic_fields() {
+    fn test_offset_compressor_basic_fields() {
         let (random_i8s, random_i16s, random_i32s, random_i64s) = generate_random_vecs(10);
 
-        let compressor = AverageCompressor::pack(random_i8s.clone());
+        let compressor = OffsetCompressor::pack(random_i8s.clone());
         println!("i8 vec: {:?}", random_i8s);
         assert_eq!(compressor.data_size, DataSize::I8);
         assert_eq!(compressor.length(), random_i8s.len());
 
-        let compressor = AverageCompressor::pack(random_i16s.clone());
+        let compressor = OffsetCompressor::pack(random_i16s.clone());
         println!("i16 vec: {:?}", random_i16s);
         assert_eq!(compressor.data_size, DataSize::I16);
         assert_eq!(compressor.length(), random_i16s.len());
 
-        let compressor = AverageCompressor::pack(random_i32s.clone());
+        let compressor = OffsetCompressor::pack(random_i32s.clone());
         println!("i32 vec: {:?}", random_i32s);
         assert_eq!(compressor.data_size, DataSize::I32);
         assert_eq!(compressor.length(), random_i32s.len());
 
-        let compressor = AverageCompressor::pack(random_i64s.clone());
+        let compressor = OffsetCompressor::pack(random_i64s.clone());
         println!("i64 vec: {:?}", random_i64s);
         assert_eq!(compressor.data_size, DataSize::I64);
         assert_eq!(compressor.length(), random_i64s.len());
@@ -573,15 +576,15 @@ mod tests {
     }
 
     #[test]
-    fn test_avg_compressor_memory_footprint() {
+    fn test_offset_compressor_memory_footprint() {
         let data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         let uncompressed_data_memory_footprint =
             size_of_val(&data) + (data.len() * DataSize::I64 as usize);
-        let compressor = AverageCompressor::pack(data.clone());
+        let compressor = OffsetCompressor::pack(data.clone());
         let compressed_data_memory_footprint = compressor.size();
         assert_eq!(
             compressed_data_memory_footprint,
-            size_of::<AverageCompressor>() + 10
+            size_of::<OffsetCompressor>() + 10
         );
         assert!(compressed_data_memory_footprint < uncompressed_data_memory_footprint);
     }
@@ -617,39 +620,39 @@ mod tests {
         let (random_i8s, random_i16s, random_i32s, random_i64s) = generate_random_vecs(2000);
 
         let i8s_size_compressor = SizeCompressor::pack(random_i8s.clone());
-        let i8s_avg_compressor = AverageCompressor::pack(random_i8s.clone());
+        let i8s_offset_compressor = OffsetCompressor::pack(random_i8s.clone());
         let i8s_dictionary_compressor = DictionaryCompressor::pack(random_i8s.clone());
         for (index, value) in random_i8s.into_iter().enumerate() {
-            assert_eq!(i8s_size_compressor.get(index), value);
-            assert_eq!(i8s_avg_compressor.get(index), value);
-            assert_eq!(i8s_dictionary_compressor.get(index), value);
+            assert_eq!(i8s_size_compressor.get(index), Some(value));
+            assert_eq!(i8s_offset_compressor.get(index), Some(value));
+            assert_eq!(i8s_dictionary_compressor.get(index), Some(value));
         }
 
         let i16s_size_compressor = SizeCompressor::pack(random_i16s.clone());
-        let i16s_avg_compressor = AverageCompressor::pack(random_i16s.clone());
+        let i16s_offset_compressor = OffsetCompressor::pack(random_i16s.clone());
         let i16s_dictionary_compressor = DictionaryCompressor::pack(random_i16s.clone());
         for (index, value) in random_i16s.into_iter().enumerate() {
-            assert_eq!(i16s_size_compressor.get(index), value);
-            assert_eq!(i16s_avg_compressor.get(index), value);
-            assert_eq!(i16s_dictionary_compressor.get(index), value);
+            assert_eq!(i16s_size_compressor.get(index), Some(value));
+            assert_eq!(i16s_offset_compressor.get(index), Some(value));
+            assert_eq!(i16s_dictionary_compressor.get(index), Some(value));
         }
 
         let i32s_size_compressor = SizeCompressor::pack(random_i32s.clone());
-        let i32s_avg_compressor = AverageCompressor::pack(random_i32s.clone());
+        let i32s_offset_compressor = OffsetCompressor::pack(random_i32s.clone());
         let i32s_dictionary_compressor = DictionaryCompressor::pack(random_i32s.clone());
         for (index, value) in random_i32s.into_iter().enumerate() {
-            assert_eq!(i32s_size_compressor.get(index), value);
-            assert_eq!(i32s_avg_compressor.get(index), value);
-            assert_eq!(i32s_dictionary_compressor.get(index), value);
+            assert_eq!(i32s_size_compressor.get(index), Some(value));
+            assert_eq!(i32s_offset_compressor.get(index), Some(value));
+            assert_eq!(i32s_dictionary_compressor.get(index), Some(value));
         }
 
         let i64s_size_compressor = SizeCompressor::pack(random_i64s.clone());
-        let i64s_avg_compressor = AverageCompressor::pack(random_i64s.clone());
+        let i64s_offset_compressor = OffsetCompressor::pack(random_i64s.clone());
         let i64s_dictionary_compressor = DictionaryCompressor::pack(random_i64s.clone());
         for (index, value) in random_i64s.into_iter().enumerate() {
-            assert_eq!(i64s_size_compressor.get(index), value);
-            assert_eq!(i64s_avg_compressor.get(index), value);
-            assert_eq!(i64s_dictionary_compressor.get(index), value);
+            assert_eq!(i64s_size_compressor.get(index), Some(value));
+            assert_eq!(i64s_offset_compressor.get(index), Some(value));
+            assert_eq!(i64s_dictionary_compressor.get(index), Some(value));
         }
     }
 
@@ -668,21 +671,21 @@ mod tests {
         let compressed_vec = Shrewd::pack(data_for_dictionary_compressor.clone());
 
         assert!(
-            matches!(compressed_vec, Shrewd::Dictionary(_)),
+            matches!(compressed_vec.0, Inner::Dictionary(_)),
             "Expected Dictionary compressor, but a different strategy was chosen!"
         );
 
         for index in 0..compressed_vec.length() {
             assert_eq!(
                 compressed_vec.get(index),
-                data_for_dictionary_compressor[index]
+                Some(data_for_dictionary_compressor[index])
             );
         }
     }
 
     #[test]
-    fn test_compressed_vector_with_data_for_average_compression() {
-        let data_for_avg_compressor: Vec<i64> = vec![
+    fn test_compressed_vector_with_data_for_offset_compression() {
+        let data_for_offset_compressor: Vec<i64> = vec![
             i64::MAX - 1,
             i64::MAX - 2,
             i64::MAX - 3,
@@ -693,15 +696,15 @@ mod tests {
             i64::MAX - 8,
             i64::MAX - 9,
         ];
-        let compressed_vec = Shrewd::pack(data_for_avg_compressor.clone());
+        let compressed_vec = Shrewd::pack(data_for_offset_compressor.clone());
 
         assert!(
-            matches!(compressed_vec, Shrewd::Average(_)),
-            "Expected Average compressor, but a different strategy was chosen!"
+            matches!(compressed_vec.0, Inner::Offset(_)),
+            "Expected Offset compressor, but a different strategy was chosen!"
         );
 
         for index in 0..compressed_vec.length() {
-            assert_eq!(compressed_vec.get(index), data_for_avg_compressor[index]);
+            assert_eq!(compressed_vec.get(index), Some(data_for_offset_compressor[index]));
         }
     }
 
@@ -714,12 +717,94 @@ mod tests {
         let compressed_vec = Shrewd::pack(data_for_size_compression.clone());
 
         assert!(
-            matches!(compressed_vec, Shrewd::Size(_)),
-            "Expected Average compressor, but a different strategy was chosen!"
+            matches!(compressed_vec.0, Inner::Size(_)),
+            "Expected Size compressor, but a different strategy was chosen!"
         );
 
         for index in 0..compressed_vec.length() {
-            assert_eq!(compressed_vec.get(index), data_for_size_compression[index]);
+            assert_eq!(compressed_vec.get(index), Some(data_for_size_compression[index]));
+        }
+    }
+
+    #[test]
+    fn test_midpoint_and_width() {
+        let cases: [(i64, i64, i64, DataSize); 11] = [
+            (5, 5, 5, DataSize::I8),
+            (-128, 127, 0, DataSize::I8),
+            (0, 255, 128, DataSize::I8), // rounding down to 127 would need I16
+            (0, 256, 128, DataSize::I16),
+            (0, u16::MAX as i64, 32768, DataSize::I16),
+            (0, u16::MAX as i64 + 1, 32768, DataSize::I32),
+            (0, u32::MAX as i64, 2147483648, DataSize::I32),
+            (0, u32::MAX as i64 + 1, 2147483648, DataSize::I64),
+            (i64::MIN, i64::MAX, 0, DataSize::I64),
+            (i64::MAX - 255, i64::MAX, i64::MAX - 127, DataSize::I8),
+            (i64::MIN, i64::MIN + 255, i64::MIN + 128, DataSize::I8),
+        ];
+        for (min_val, max_val, mid, width) in cases {
+            assert_eq!(
+                OffsetCompressor::midpoint_and_width(min_val, max_val),
+                (mid, width),
+                "min={min_val} max={max_val}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_offset_compressor_round_trip_at_width_boundaries() {
+        let bases = [i64::MIN, -1_000_000_007, -1, 0, 1, 1_000_000_007, i64::MAX];
+        let cases = [
+            (u8::MAX as u64, DataSize::I8),
+            (u8::MAX as u64 + 1, DataSize::I16),
+            (u16::MAX as u64, DataSize::I16),
+            (u16::MAX as u64 + 1, DataSize::I32),
+            (u32::MAX as u64, DataSize::I32),
+            (u32::MAX as u64 + 1, DataSize::I64),
+        ];
+        for base in bases {
+            for (range, width) in cases {
+                // Keep min..=max inside i64 whichever end the base sits at.
+                let min_val = if base > 0 { base.wrapping_sub(range as i64) } else { base };
+                let max_val = min_val.wrapping_add(range as i64);
+                let data = vec![max_val, min_val, min_val.wrapping_add((range / 2) as i64), max_val];
+                let compressor = OffsetCompressor::pack(data.clone());
+                assert_eq!(compressor.data_size, width, "min={min_val} max={max_val}");
+                for (index, &value) in data.iter().enumerate() {
+                    assert_eq!(compressor.get(index), Some(value), "min={min_val} max={max_val}");
+                }
+            }
+        }
+
+        let data = vec![i64::MIN, i64::MAX, 0, -1, 1];
+        let compressor = OffsetCompressor::pack(data.clone());
+        assert_eq!(compressor.data_size, DataSize::I64);
+        for (index, &value) in data.iter().enumerate() {
+            assert_eq!(compressor.get(index), Some(value));
+        }
+
+        let data = vec![-42; 100];
+        let compressor = OffsetCompressor::pack(data.clone());
+        assert_eq!(compressor.data_size, DataSize::I8);
+        assert_eq!(compressor.length(), data.len());
+        for (index, &value) in data.iter().enumerate() {
+            assert_eq!(compressor.get(index), Some(value));
+        }
+    }
+
+    #[test]
+    fn test_skewed_data_routes_to_offset() {
+        // The mean (~49) put the 250 outlier 201 away, forcing I16; the midpoint keeps every
+        // delta within I8.
+        let mut data: Vec<i64> = (0..10_000i64).map(|i| (i * 37) % 100).collect();
+        data.push(250);
+        let compressed_vec = Shrewd::pack(data.clone());
+        assert!(
+            matches!(compressed_vec.0, Inner::Offset(_)),
+            "Expected Offset compressor, but got {}", compressed_vec.compressor_type()
+        );
+        assert_eq!(compressed_vec.size(), size_of::<Shrewd>() + data.len());
+        for (index, &value) in data.iter().enumerate() {
+            assert_eq!(compressed_vec.get(index), Some(value));
         }
     }
 }

@@ -117,6 +117,7 @@ impl HyperLogLog {
     // splitmix64 finalizer — cheap, well-distributed, no external dependency
     #[inline]
     fn mix(mut z: u64) -> u64 {
+        z = z.wrapping_add(0x9E3779B97F4A7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
         z ^ (z >> 31)

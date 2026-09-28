@@ -1,6 +1,8 @@
 
 use std::mem::size_of;
 
+use super::errors::DecodeError;
+
 pub(crate) const SIZE_I8: u8 = size_of::<i8>() as u8;
 pub(crate) const SIZE_I16: u8 = size_of::<i16>() as u8;
 pub(crate) const SIZE_I32: u8 = size_of::<i32>() as u8;
@@ -40,6 +42,21 @@ impl DataSize {
     }
 }
 
+impl TryFrom<u8> for DataSize {
+    type Error = DecodeError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            SIZE_I8 => Ok(DataSize::I8),
+            SIZE_I16 => Ok(DataSize::I16),
+            SIZE_I32 => Ok(DataSize::I32),
+            SIZE_I64 => Ok(DataSize::I64),
+            other => Err(DecodeError::InvalidDataSize(other)),
+        }
+    }
+}
+
+
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
 #[repr(u8)]
 pub(crate) enum IndexSize {
@@ -69,6 +86,20 @@ impl IndexSize {
             IndexSize::U16 => 1,
             IndexSize::U32 => 2,
             IndexSize::U64 => 3,
+        }
+    }
+}
+
+impl TryFrom<u8> for IndexSize {
+    type Error = DecodeError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            SIZE_I8 => Ok(IndexSize::U8),
+            SIZE_I16 => Ok(IndexSize::U16),
+            SIZE_I32 => Ok(IndexSize::U32),
+            SIZE_I64 => Ok(IndexSize::U64),
+            other => Err(DecodeError::InvalidDataSize(other)),
         }
     }
 }

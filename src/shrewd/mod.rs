@@ -2,6 +2,7 @@
 pub mod sizes;
 pub mod compressors;
 pub mod errors;
+mod codec;
 
 use sizes::{DataSize, IndexSize};
 use crate::shrewd::errors::DecodeError;
@@ -12,7 +13,7 @@ pub trait Compressor: Sized {
     fn size(&self) -> usize;
     fn length(&self) -> usize;
 
-    fn compressor_type(&self) -> String;
+    fn compressor_type(&self) -> &'static str;
 
     fn to_bytes(&self) -> Vec<u8>;
 

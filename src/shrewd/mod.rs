@@ -1,16 +1,22 @@
 
 pub mod sizes;
 pub mod compressors;
+pub mod errors;
 
 use sizes::{DataSize, IndexSize};
+use crate::shrewd::errors::DecodeError;
 
-pub trait Compressor {
+pub trait Compressor: Sized {
     fn pack(v: Vec<i64>) -> Self;
     fn get(&self, index: usize) -> Option<i64>;
     fn size(&self) -> usize;
     fn length(&self) -> usize;
 
     fn compressor_type(&self) -> String;
+
+    fn to_bytes(&self) -> Vec<u8>;
+
+    fn from_bytes(data: &[u8]) -> Result<Self, DecodeError>;
 }
 
 pub struct Shrewd(Inner);

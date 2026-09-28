@@ -4,12 +4,39 @@ use std::collections::{HashMap};
 use std::string::ToString;
 use super::sizes::{HyperLogLog, DataSize, IndexSize};
 use super::{Compressor, Shrewd, Inner, SizeCompressor, OffsetCompressor, DictionaryCompressor};
+use super::errors::DecodeError;
 
 const COMPRESSOR_TYPE_SIZE: &str = "Size";
 const COMPRESSOR_TYPE_OFFSET: &str = "Offset";
 const COMPRESSOR_TYPE_DICTIONARY: &str = "Dictionary";
 
+pub(crate) enum CompressorType {
+    Size = 1,
+    Offset = 2,
+    Dictionary = 3
+}
 
+impl TryFrom<u8> for CompressorType {
+    type Error = DecodeError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(CompressorType::Size),
+            2 => Ok(CompressorType::Offset),
+            3 => Ok(CompressorType::Dictionary),
+            other => Err(DecodeError::InvalidCompressorType(other)),
+        }
+    }
+}
+
+
+fn read_header(bytes: &[u8]) -> CompressorType {
+    bytes[0].try_into().unwrap()
+}
+
+fn write_header(out: &mut Vec<u8>, compressor_type: CompressorType) {
+    out.push(compressor_type as u8);
+}
 
 impl Compressor for Shrewd {
     fn pack(v: Vec<i64>) -> Self {
@@ -102,6 +129,32 @@ impl Compressor for Shrewd {
             Inner::Dictionary(c) => c.compressor_type(),
         }
     }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        match &self.0 {
+            Inner::Size(c) => c.to_bytes(),
+            Inner::Offset(c) => c.to_bytes(),
+            Inner::Dictionary(c) => c.to_bytes(),
+        }
+    }
+
+    fn from_bytes(data: &[u8]) -> Result<Self, DecodeError> {
+        let compressor_type = read_header(data);
+        match compressor_type {
+            CompressorType::Size => match SizeCompressor::from_bytes(&data) {
+                    Ok(c) => Ok(Shrewd(Inner::Size(c))),
+                    Err(e) => Err(e),
+            },
+            CompressorType::Offset => match OffsetCompressor::from_bytes(&data) {
+                    Ok(c) => Ok(Shrewd(Inner::Offset(c))),
+                    Err(e) => Err(e),
+            },
+            CompressorType::Dictionary => match DictionaryCompressor::from_bytes(&data) {
+                Ok(c) => Ok(Shrewd(Inner::Dictionary(c))),
+                Err(e) => Err(e),
+            }
+        }
+    }
 }
 
 
@@ -117,17 +170,17 @@ impl SizeCompressor {
             }
             DataSize::I16 => {
                 for value in v {
-                    data.extend_from_slice(&(value as i16).to_ne_bytes());
+                    data.extend_from_slice(&(value as i16).to_le_bytes());
                 }
             }
             DataSize::I32 => {
                 for value in v {
-                    data.extend_from_slice(&(value as i32).to_ne_bytes());
+                    data.extend_from_slice(&(value as i32).to_le_bytes());
                 }
             }
             DataSize::I64 => {
                 for value in v {
-                    data.extend_from_slice(&value.to_ne_bytes());
+                    data.extend_from_slice(&value.to_le_bytes());
                 }
             }
         }
@@ -164,7 +217,7 @@ impl Compressor for SizeCompressor {
             DataSize::I8 => self.data[index] as i8 as i64,
             DataSize::I16 => {
                 let real_index = index * DataSize::I16 as usize;
-                let val = i16::from_ne_bytes(
+                let val = i16::from_le_bytes(
                     self.data[real_index..(real_index + DataSize::I16 as usize)]
                         .try_into()
                         .unwrap(),
@@ -173,7 +226,7 @@ impl Compressor for SizeCompressor {
             }
             DataSize::I32 => {
                 let real_index = index * DataSize::I32 as usize;
-                let val = i32::from_ne_bytes(
+                let val = i32::from_le_bytes(
                     self.data[real_index..(real_index + DataSize::I32 as usize)]
                         .try_into()
                         .unwrap(),
@@ -182,7 +235,7 @@ impl Compressor for SizeCompressor {
             }
             DataSize::I64 => {
                 let real_index = index * DataSize::I64 as usize;
-                i64::from_ne_bytes(
+                i64::from_le_bytes(
                     self.data[real_index..(real_index + DataSize::I64 as usize)]
                         .try_into()
                         .unwrap(),
@@ -204,6 +257,27 @@ impl Compressor for SizeCompressor {
     #[inline(always)]
     fn compressor_type(&self) -> String {
         COMPRESSOR_TYPE_SIZE.to_string()
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(size_of::<u8>() + size_of::<u8>() + size_of::<usize>() + self.data.len());
+        bytes.push(CompressorType::Size as u8);
+        bytes.push(self.data_size as u8);
+        bytes.extend_from_slice(&self.length().to_le_bytes());
+        bytes.extend_from_slice(&self.data);
+        bytes
+    }
+
+    fn from_bytes(data: &[u8]) -> Result<Self, DecodeError> {
+        let data_size: DataSize = data[1].try_into()?;
+        let start = 2 + size_of::<usize>();
+        let length: usize = usize::from_le_bytes(data[2..2 + size_of::<usize>()].try_into().unwrap());
+        let byte_length = length * data_size as usize;
+        let data = data[start..start + byte_length].to_vec();
+        Ok(Self {
+            data_size,
+            data,
+        })
     }
 }
 
@@ -245,16 +319,16 @@ impl OffsetCompressor {
             };
             match max_delta_from_center {
                 DataSize::I8 => {
-                    compressed_data.extend_from_slice(&(transformed_value as i8).to_ne_bytes());
+                    compressed_data.extend_from_slice(&(transformed_value as i8).to_le_bytes());
                 }
                 DataSize::I16 => {
-                    compressed_data.extend_from_slice(&(transformed_value as i16).to_ne_bytes());
+                    compressed_data.extend_from_slice(&(transformed_value as i16).to_le_bytes());
                 }
                 DataSize::I32 => {
-                    compressed_data.extend_from_slice(&(transformed_value as i32).to_ne_bytes());
+                    compressed_data.extend_from_slice(&(transformed_value as i32).to_le_bytes());
                 }
                 DataSize::I64 => {
-                    compressed_data.extend_from_slice(&transformed_value.to_ne_bytes());
+                    compressed_data.extend_from_slice(&transformed_value.to_le_bytes());
                 }
             }
         }
@@ -297,7 +371,7 @@ impl Compressor for OffsetCompressor {
             DataSize::I8 => self.data[index] as i8 as i64,
             DataSize::I16 => {
                 let real_index = index * DataSize::I16 as usize;
-                i16::from_ne_bytes(
+                i16::from_le_bytes(
                     self.data[real_index..(real_index + DataSize::I16 as usize)]
                         .try_into()
                         .unwrap(),
@@ -305,7 +379,7 @@ impl Compressor for OffsetCompressor {
             }
             DataSize::I32 => {
                 let real_index = index * DataSize::I32 as usize;
-                i32::from_ne_bytes(
+                i32::from_le_bytes(
                     self.data[real_index..(real_index + DataSize::I32 as usize)]
                         .try_into()
                         .unwrap(),
@@ -313,10 +387,10 @@ impl Compressor for OffsetCompressor {
             }
             DataSize::I64 => {
                 let real_index = index * DataSize::I64 as usize;
-                i64::from_ne_bytes(
+                i64::from_le_bytes(
                     self.data[real_index..(real_index + DataSize::I64 as usize)]
                         .try_into()
-                        .expect("Slice was not exactly 8 bytes long"),
+                        .unwrap(),
                 )
             }
         };
@@ -344,6 +418,35 @@ impl Compressor for OffsetCompressor {
     #[inline(always)]
     fn compressor_type(&self) -> String {
         COMPRESSOR_TYPE_OFFSET.to_string()
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(size_of::<u8>() + size_of::<u8>() + size_of::<u8>() + size_of::<usize>() + DataSize::I64 as usize + self.data.len());
+        out.push(CompressorType::Offset as u8);
+        out.push(self.data_size as u8);
+        out.push(self.original_data_size as u8);
+        out.extend_from_slice(&self.length().to_le_bytes());
+        out.extend_from_slice(&self.center.to_le_bytes());
+        out.extend_from_slice(&self.data);
+        out
+    }
+
+    fn from_bytes(data: &[u8]) -> Result<Self, DecodeError> {
+        let data_size: DataSize = data[1].try_into()?;
+        let original_data_size: DataSize = data[2].try_into()?;
+        let mut index = 3;
+        let length: usize = usize::from_le_bytes(data[index..index + size_of::<usize>()].try_into().unwrap());
+        index += size_of::<usize>();
+        let center: i64 = i64::from_le_bytes(data[index..index + size_of::<i64>()].try_into().unwrap());
+        index += size_of::<i64>();
+        let byte_length = length * data_size as usize;
+        let data = data[index..index + byte_length].to_vec();
+        Ok(Self {
+            data_size: data_size,
+            original_data_size: original_data_size,
+            center: center,
+            data: data,
+        })
     }
 }
 
@@ -383,19 +486,19 @@ impl Compressor for DictionaryCompressor {
             IndexSize::U16 => {
                 for value in v.into_iter() {
                     let index = lookup[&value];
-                    data.extend_from_slice(&((index as u16).to_ne_bytes()));
+                    data.extend_from_slice(&((index as u16).to_le_bytes()));
                 }
             }
             IndexSize::U32 => {
                 for value in v.into_iter() {
                     let index = lookup[&value];
-                    data.extend_from_slice(&((index as u32).to_ne_bytes()));
+                    data.extend_from_slice(&((index as u32).to_le_bytes()));
                 }
             }
             IndexSize::U64 => {
                 for value in v.into_iter() {
                     let index = lookup[&value];
-                    data.extend_from_slice(&((index as u64).to_ne_bytes()));
+                    data.extend_from_slice(&((index as u64).to_le_bytes()));
                 }
             }
         }
@@ -418,28 +521,28 @@ impl Compressor for DictionaryCompressor {
             }
             IndexSize::U16 => {
                 let real_index = index * IndexSize::U16 as usize as usize;
-                let dict_index: u16 = u16::from_ne_bytes(
+                let dict_index: u16 = u16::from_le_bytes(
                     self.data[real_index..(real_index + IndexSize::U16 as usize)]
                         .try_into()
-                        .expect("Slice was not exactly 2 bytes long"),
+                        .unwrap(),
                 );
                 self.unique_values[dict_index as usize]
             }
             IndexSize::U32 => {
                 let real_index = index * IndexSize::U32 as usize as usize;
-                let dict_index: u32 = u32::from_ne_bytes(
+                let dict_index: u32 = u32::from_le_bytes(
                     self.data[real_index..(real_index + IndexSize::U32 as usize)]
                         .try_into()
-                        .expect("Slice was not exactly 4 bytes long"),
+                        .unwrap(),
                 );
                 self.unique_values[dict_index as usize]
             }
             IndexSize::U64 => {
                 let real_index = index * IndexSize::U64 as usize;
-                let dict_index: u64 = u64::from_ne_bytes(
+                let dict_index: u64 = u64::from_le_bytes(
                     self.data[real_index..(real_index + IndexSize::U64 as usize)]
                         .try_into()
-                        .expect("Slice was not exactly 8 bytes long"),
+                        .unwrap(),
                 );
                 self.unique_values[dict_index as usize]
             }
@@ -459,6 +562,41 @@ impl Compressor for DictionaryCompressor {
     #[inline(always)]
     fn compressor_type(&self) -> String {
         COMPRESSOR_TYPE_DICTIONARY.to_string()
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(size_of::<u8>() + size_of::<u8>() + size_of::<usize>() + (self.unique_values.len() * DataSize::I64 as usize) + size_of::<usize>() + self.data.len());
+        bytes.push(CompressorType::Dictionary as u8);
+        bytes.push(self.index_size as u8);
+        bytes.extend_from_slice(&self.unique_values.len().to_le_bytes());
+        for &unique_value in &self.unique_values {
+            bytes.extend_from_slice(&unique_value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&self.length().to_le_bytes());
+        bytes.extend_from_slice(&self.data);
+        bytes
+    }
+
+    fn from_bytes(data: &[u8]) -> Result<Self, DecodeError> {
+        let index_size: IndexSize = data[1].try_into()?;
+        let mut index = 2;
+        let unique_values_length = usize::from_le_bytes(data[2..(2+size_of::<usize>())].try_into().unwrap());
+        index += size_of::<usize>();
+        let mut unique_values = Vec::with_capacity(unique_values_length);
+        for _ in 0..unique_values_length {
+            let unique_value = i64::from_le_bytes(data[index..(index+DataSize::I64 as usize)].try_into().unwrap());
+            index += DataSize::I64 as usize;
+            unique_values.push(unique_value);
+        }
+        let element_count = usize::from_le_bytes(data[index..index + size_of::<usize>()].try_into().unwrap());
+        index += size_of::<usize>();
+        let byte_length = element_count * index_size as usize;
+        let data = data[index..index + byte_length].to_vec();
+        Ok(Self {
+            index_size: index_size,
+            unique_values: unique_values,
+            data: data,
+        })
     }
 }
 
@@ -806,5 +944,86 @@ mod tests {
         for (index, &value) in data.iter().enumerate() {
             assert_eq!(compressed_vec.get(index), Some(value));
         }
+    }
+
+    /// Encodes `compressor`, decodes the bytes, and checks the copy holds exactly `data`
+    /// and re-encodes to the same bytes.
+    fn assert_round_trip<C: Compressor>(compressor: C, data: &[i64], label: &str) {
+        let bytes = compressor.to_bytes();
+        let decoded = C::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.length(), data.len(), "{label}: length");
+        for (index, &value) in data.iter().enumerate() {
+            assert_eq!(decoded.get(index), Some(value), "{label}: index {index}");
+        }
+        assert_eq!(decoded.get(data.len()), None, "{label}: past the end");
+        assert_eq!(decoded.to_bytes(), bytes, "{label}: re-encoded bytes");
+    }
+
+    #[test]
+    fn test_size_compressor_round_trip() {
+        let cases: [(Vec<i64>, DataSize); 5] = [
+            (vec![], DataSize::I8),
+            (vec![i8::MIN as i64, -1, 0, 1, i8::MAX as i64], DataSize::I8),
+            (vec![i16::MIN as i64, -300, 0, 1000, i16::MAX as i64], DataSize::I16),
+            (vec![i32::MIN as i64, -5_000_000, 0, 5_000_000, i32::MAX as i64], DataSize::I32),
+            (vec![i64::MIN, -5_000_000_000, 0, 5_000_000_000, i64::MAX], DataSize::I64),
+        ];
+        for (data, width) in cases {
+            let compressor = SizeCompressor::pack(data.clone());
+            assert_eq!(compressor.data_size, width, "{data:?}");
+            assert_round_trip(compressor, &data, &format!("Size {width:?}"));
+        }
+    }
+
+    #[test]
+    fn test_offset_compressor_round_trip() {
+        let cases: [(Vec<i64>, DataSize); 5] = [
+            (vec![], DataSize::I8),
+            (vec![1000, 1001, 1100, 1255], DataSize::I8),
+            ((0..100).map(|x| 5_000_000 + x * 300).collect(), DataSize::I16),
+            ((0..100).map(|x| 10_000_000_000 + x * 10_000_000).collect(), DataSize::I32),
+            (vec![i64::MIN, 0, i64::MAX, -1], DataSize::I64),
+        ];
+        for (data, width) in cases {
+            let compressor = OffsetCompressor::pack(data.clone());
+            assert_eq!(compressor.data_size, width, "{data:?}");
+            assert_round_trip(compressor, &data, &format!("Offset {width:?}"));
+        }
+    }
+
+    #[test]
+    fn test_dictionary_compressor_round_trip() {
+        let cases: [(Vec<i64>, IndexSize); 4] = [
+            (vec![], IndexSize::U8),
+            (vec![7, 7, -7, i64::MAX, i64::MIN, 7], IndexSize::U8),
+            ((0..1000).map(|x| (x % 300) << 40).collect(), IndexSize::U16),
+            ((0..70_000).map(|x| x * 3).collect(), IndexSize::U32),
+        ];
+        for (data, width) in cases {
+            let compressor = DictionaryCompressor::pack(data.clone());
+            assert_eq!(compressor.index_size, width, "{data:?}");
+            assert_round_trip(compressor, &data, &format!("Dictionary {width:?}"));
+        }
+    }
+
+    #[test]
+    fn test_shrewd_round_trip() {
+        let size_data: Vec<i64> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let offset_data: Vec<i64> = (0..100).map(|x| 5_000_000 + x * 300).collect();
+        let dictionary_data: Vec<i64> = (0..1000).map(|x| (x % 300) << 40).collect();
+
+        let compressor = Shrewd::pack(size_data.clone());
+        assert!(matches!(compressor.0, Inner::Size(_)));
+        assert_round_trip(compressor, &size_data, "Shrewd Size");
+
+        let compressor = Shrewd::pack(offset_data.clone());
+        assert!(matches!(compressor.0, Inner::Offset(_)));
+        assert_round_trip(compressor, &offset_data, "Shrewd Offset");
+
+        let compressor = Shrewd::pack(dictionary_data.clone());
+        assert!(matches!(compressor.0, Inner::Dictionary(_)));
+        assert_round_trip(compressor, &dictionary_data, "Shrewd Dictionary");
+
+        assert_round_trip(Shrewd::pack(vec![]), &[], "Shrewd empty");
     }
 }

@@ -8,6 +8,7 @@ readme = "README.md"
 license = "Apache-2.0"
 
 [dev-dependencies]
+divan = "0.1.21"
 rand = {version = "0.10.3"}
 
 [profile.release]
@@ -15,3 +16,12 @@ opt-level = 3       # Triggers LLVM's absolute highest vectorization routines
 lto = true          # Enables Link-Time Optimization across module boundaries
 codegen-units = 1   # Minimizes code generation splits to allow deep cross-inlining
 panic = "abort"     # Strips heavy stack-unwinding machinery for micro-ben
+
+
+[[bench]]
+name = "runtime"
+harness = false
+
+[[bench]]
+name = "memory"
+harness = false

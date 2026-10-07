@@ -1,5 +1,3 @@
-use std::mem::size_of;
-
 use super::errors::DecodeError;
 
 /// Cursor over an encoded buffer. Every read consumes bytes from the front and fails with
@@ -25,9 +23,12 @@ impl<'a> Reader<'a> {
         Ok(byte)
     }
 
+    /// Reads a length stored as a little-endian `u64`. A length that does not fit in `usize`
+    /// cannot describe data that is in memory, so it is reported as the input ending early.
     #[inline]
-    pub(crate) fn read_usize(&mut self) -> Result<usize, DecodeError> {
-        Ok(usize::from_le_bytes(self.read_array::<{ size_of::<usize>() }>()?))
+    pub(crate) fn read_len(&mut self) -> Result<usize, DecodeError> {
+        let len = u64::from_le_bytes(self.read_array()?);
+        usize::try_from(len).map_err(|_| DecodeError::UnexpectedEOF)
     }
 
     #[inline]
@@ -56,13 +57,13 @@ mod tests {
     #[test]
     fn test_reads_advance_through_buffer() {
         let mut bytes = vec![7u8];
-        bytes.extend_from_slice(&42usize.to_le_bytes());
+        bytes.extend_from_slice(&42u64.to_le_bytes());
         bytes.extend_from_slice(&(-5i64).to_le_bytes());
         bytes.extend_from_slice(&[1, 2, 3, 4]);
 
         let mut reader = Reader::new(&bytes);
         assert_eq!(reader.read_u8(), Ok(7));
-        assert_eq!(reader.read_usize(), Ok(42));
+        assert_eq!(reader.read_len(), Ok(42));
         assert_eq!(reader.read_i64(), Ok(-5));
         assert_eq!(reader.read_packed(2, 2), Ok(&[1u8, 2, 3, 4][..]));
         assert_eq!(reader.read_u8(), Err(DecodeError::UnexpectedEOF));

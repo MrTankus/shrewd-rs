@@ -6,7 +6,9 @@
 
 #![allow(dead_code)]
 
-use shrewd_rs::shrewd::{Compressor, Shrewd};
+use std::mem::size_of;
+
+use shrewd_rs::Shrewd;
 
 /// Lengths chosen by where the *packed* data (1-2 bytes per element for these datasets) lands
 /// in the cache hierarchy, sized for a desktop-class core (~48 KiB L1d, 1 MiB L2, 32 MiB L3):
@@ -47,6 +49,8 @@ impl Rng {
 
 pub trait Dataset {
     const STRATEGY: &'static str;
+    /// Bytes each element takes once packed, used to size the equal-memory benchmarks.
+    const PACKED_BYTES_PER_ELEMENT: usize;
 
     fn value(rng: &mut Rng) -> i64;
 
@@ -61,6 +65,7 @@ pub struct Size;
 
 impl Dataset for Size {
     const STRATEGY: &'static str = "Size";
+    const PACKED_BYTES_PER_ELEMENT: usize = 2;
 
     fn value(rng: &mut Rng) -> i64 {
         rng.below(60_001) as i64 - 30_000
@@ -72,6 +77,7 @@ pub struct Offset;
 
 impl Dataset for Offset {
     const STRATEGY: &'static str = "Offset";
+    const PACKED_BYTES_PER_ELEMENT: usize = 1;
 
     fn value(rng: &mut Rng) -> i64 {
         1_000_000_000_000 + rng.below(251) as i64
@@ -83,6 +89,7 @@ pub struct Dictionary;
 
 impl Dataset for Dictionary {
     const STRATEGY: &'static str = "Dictionary";
+    const PACKED_BYTES_PER_ELEMENT: usize = 1;
 
     fn value(rng: &mut Rng) -> i64 {
         (rng.below(16) as i64 - 8) * 1_000_000_000_000_000
@@ -91,7 +98,7 @@ impl Dataset for Dictionary {
 
 pub fn packed<D: Dataset>(len: usize) -> Shrewd {
     let packed = Shrewd::pack(D::generate(len));
-    assert_eq!(packed.compressor_type(), D::STRATEGY, "dataset routed to the wrong strategy (len {len})");
+    assert_eq!(packed.compressor_type().as_str(), D::STRATEGY, "dataset routed to the wrong strategy (len {len})");
     packed
 }
 
@@ -108,4 +115,118 @@ pub fn reduce(hash: u64, len: usize) -> usize {
 pub fn chase(state: &mut u64, value: i64, len: usize) -> usize {
     *state = (*state ^ value as u64).wrapping_mul(0x9E3779B97F4A7C15) | 1;
     reduce(*state, len)
+}
+
+/// A container under comparison: a plain `Vec<i64>`, or a `Shrewd` packed from one dataset.
+/// Each method is the container's natural way of doing the same job, so results compare directly.
+pub trait Subject: Sync {
+    const BYTES_PER_ELEMENT: usize;
+
+    fn build(len: usize) -> Self;
+    fn len(&self) -> usize;
+    /// Heap plus the value itself.
+    fn footprint(&self) -> usize;
+    fn get(&self, index: usize) -> Option<i64>;
+    fn sum_for_loop(&self) -> i64;
+    fn sum_fold(&self) -> i64;
+    /// `Shrewd`: `iter_buffered::<1024>().fold`. `Vec`: the same as `sum_fold`.
+    fn sum_fold_buffered(&self) -> i64;
+    /// Copies up to `out.len()` values starting at `start`; returns how many.
+    fn copy_into(&self, start: usize, out: &mut [i64]) -> usize;
+    fn collect(&self) -> Vec<i64>;
+}
+
+impl Subject for Vec<i64> {
+    const BYTES_PER_ELEMENT: usize = size_of::<i64>();
+
+    fn build(len: usize) -> Self {
+        Size::generate(len)
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn footprint(&self) -> usize {
+        self.capacity() * size_of::<i64>() + size_of::<Vec<i64>>()
+    }
+
+    #[inline]
+    fn get(&self, index: usize) -> Option<i64> {
+        self.as_slice().get(index).copied()
+    }
+
+    fn sum_for_loop(&self) -> i64 {
+        let mut sum = 0i64;
+        for &value in self {
+            sum = sum.wrapping_add(value);
+        }
+        sum
+    }
+
+    fn sum_fold(&self) -> i64 {
+        self.iter().fold(0i64, |sum, &value| sum.wrapping_add(value))
+    }
+
+    fn sum_fold_buffered(&self) -> i64 {
+        self.sum_fold()
+    }
+
+    fn copy_into(&self, start: usize, out: &mut [i64]) -> usize {
+        let n = out.len().min(self.as_slice().len().saturating_sub(start));
+        out[..n].copy_from_slice(&self[start..start + n]);
+        n
+    }
+
+    fn collect(&self) -> Vec<i64> {
+        self.iter().copied().collect()
+    }
+}
+
+/// A `Shrewd` packed from dataset `D` (the router's choice is asserted when it is built).
+pub struct Packed<D>(Shrewd, std::marker::PhantomData<fn() -> D>);
+
+impl<D: Dataset> Subject for Packed<D> {
+    const BYTES_PER_ELEMENT: usize = D::PACKED_BYTES_PER_ELEMENT;
+
+    fn build(len: usize) -> Self {
+        Packed(packed::<D>(len), std::marker::PhantomData)
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn footprint(&self) -> usize {
+        self.0.memory_size()
+    }
+
+    #[inline]
+    fn get(&self, index: usize) -> Option<i64> {
+        self.0.get(index)
+    }
+
+    fn sum_for_loop(&self) -> i64 {
+        let mut sum = 0i64;
+        for value in &self.0 {
+            sum = sum.wrapping_add(value);
+        }
+        sum
+    }
+
+    fn sum_fold(&self) -> i64 {
+        self.0.iter().fold(0i64, |sum, value| sum.wrapping_add(value))
+    }
+
+    fn sum_fold_buffered(&self) -> i64 {
+        self.0.iter_buffered::<1024>().fold(0i64, |sum, value| sum.wrapping_add(value))
+    }
+
+    fn copy_into(&self, start: usize, out: &mut [i64]) -> usize {
+        self.0.decode_into(start, out)
+    }
+
+    fn collect(&self) -> Vec<i64> {
+        self.0.iter().collect()
+    }
 }
